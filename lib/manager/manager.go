@@ -404,7 +404,9 @@ func (m *manager) Stop() error {
 		}
 	}
 	m.quitChannels = make([]chan error, 0, 2)
-	return nil
+	// Housekeeping has stopped, so no more stats will be enqueued: flush the
+	// storage backends and close their connections.
+	return m.memoryCache.Close()
 }
 
 func (m *manager) destroyCollectors() {

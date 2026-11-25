@@ -16,12 +16,13 @@ package redis
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
-	"sync"
 	"time"
 
 	info "github.com/google/cadvisor/info/v1"
 	storage "github.com/google/cadvisor/lib/storage"
+	"github.com/google/cadvisor/lib/storage/buffered"
 
 	redis "github.com/gomodule/redigo/redis"
 )
@@ -30,14 +31,22 @@ func init() {
 	storage.RegisterStorageDriver("redis", new)
 }
 
+// Socket timeouts for redis connections. They bound how long a single batch
+// write can be stuck so the exporter's retry/backoff and shutdown timeout
+// stay effective against a half-open connection.
+const (
+	redisDialTimeout  = 5 * time.Second
+	redisReadTimeout  = 10 * time.Second
+	redisWriteTimeout = 10 * time.Second
+)
+
+// redisStorage marshals cAdvisor stats to JSON documents and pushes whole
+// batches to Redis with a single LPUSH. The buffered.Exporter wrapping it
+// provides batching, retries, queue bounds and write pacing.
 type redisStorage struct {
-	conn           redis.Conn
-	machineName    string
-	redisKey       string
-	bufferDuration time.Duration
-	lastWrite      time.Time
-	lock           sync.Mutex
-	readyToFlush   func() bool
+	pool        *redis.Pool
+	machineName string
+	redisKey    string
 }
 
 type detailSpec struct {
@@ -52,16 +61,16 @@ func new() (storage.StorageDriver, error) {
 	if err != nil {
 		return nil, err
 	}
-	return newStorage(
+	writer, err := newStorage(
 		hostname,
 		*storage.ArgDbName,
 		*storage.ArgDbHost,
-		*storage.ArgDbBufferDuration,
+		*storage.ArgBufferConcurrency,
 	)
-}
-
-func (s *redisStorage) defaultReadyToFlush() bool {
-	return time.Since(s.lastWrite) >= s.bufferDuration
+	if err != nil {
+		return nil, err
+	}
+	return buffered.NewDriver(writer, buffered.ConfigFromFlags()), nil
 }
 
 // We must add some default params (for example: MachineName,ContainerName...)because containerStats do not include them
@@ -82,34 +91,36 @@ func (s *redisStorage) containerStatsAndDefaultValues(cInfo *info.ContainerInfo,
 	return detail
 }
 
-// Push the data into redis
-func (s *redisStorage) AddStats(cInfo *info.ContainerInfo, stats *info.ContainerStats) error {
-	if stats == nil {
-		return nil
-	}
-	var seriesToFlush []byte
-	func() {
-		// AddStats will be invoked simultaneously from multiple threads and only one of them will perform a write.
-		s.lock.Lock()
-		defer s.lock.Unlock()
-		// Add some default params based on containerStats
-		detail := s.containerStatsAndDefaultValues(cInfo, stats)
-		// To json
-		b, _ := json.Marshal(detail)
-		if s.readyToFlush() {
-			seriesToFlush = b
-			s.lastWrite = time.Now()
+// WriteBatch marshals every sample of the batch and pushes them to Redis in
+// one LPUSH transaction. It is safe for concurrent use: every call borrows
+// its own connection from the pool.
+func (s *redisStorage) WriteBatch(batch []buffered.Sample) error {
+	args := make([]interface{}, 0, len(batch)+1)
+	args = append(args, s.redisKey)
+	for _, sample := range batch {
+		if sample.Stats == nil {
+			continue
 		}
-	}()
-	if len(seriesToFlush) == 0 {
+		b, err := json.Marshal(s.containerStatsAndDefaultValues(sample.ContainerInfo, sample.Stats))
+		if err != nil {
+			return fmt.Errorf("failed to marshal stats for redis: %w", err)
+		}
+		args = append(args, b)
+	}
+	if len(args) == 1 {
 		return nil
 	}
-	// We use redis's "LPUSH" to push the data to the redis
-	return s.conn.Send("LPUSH", s.redisKey, seriesToFlush)
+
+	conn := s.pool.Get()
+	defer conn.Close()
+	if _, err := conn.Do("LPUSH", args...); err != nil {
+		return fmt.Errorf("failed to push stats to redis: %w", err)
+	}
+	return nil
 }
 
 func (s *redisStorage) Close() error {
-	return s.conn.Close()
+	return s.pool.Close()
 }
 
 // Create a new redis storage driver.
@@ -121,19 +132,43 @@ func newStorage(
 	machineName,
 	redisKey,
 	redisHost string,
-	bufferDuration time.Duration,
-) (storage.StorageDriver, error) {
-	conn, err := redis.Dial("tcp", redisHost)
-	if err != nil {
-		return nil, err
+	concurrency int,
+) (*redisStorage, error) {
+	if concurrency < 1 {
+		concurrency = 1
 	}
-	ret := &redisStorage{
-		conn:           conn,
-		machineName:    machineName,
-		redisKey:       redisKey,
-		bufferDuration: bufferDuration,
-		lastWrite:      time.Now(),
+	// Connections are dialed lazily: a redis outage at startup must not
+	// prevent cAdvisor from starting; the exporter retries until redis
+	// comes back. Explicit timeouts are essential so that a half-open TCP
+	// connection fails fast instead of pinning a worker forever and
+	// defeating the exporter's close timeout.
+	pool := &redis.Pool{
+		MaxIdle:     concurrency,
+		MaxActive:   concurrency,
+		IdleTimeout: 5 * time.Minute,
+		// Wait for a connection instead of failing when all are busy; the
+		// exporter concurrency matches MaxActive so waits only happen during
+		// brief scheduling overlap.
+		Wait: true,
+		Dial: func() (redis.Conn, error) {
+			return redis.Dial("tcp", redisHost,
+				redis.DialConnectTimeout(redisDialTimeout),
+				redis.DialReadTimeout(redisReadTimeout),
+				redis.DialWriteTimeout(redisWriteTimeout),
+			)
+		},
+		TestOnBorrow: func(c redis.Conn, t time.Time) error {
+			if time.Since(t) < time.Minute {
+				return nil
+			}
+			_, err := c.Do("PING")
+			return err
+		},
 	}
-	ret.readyToFlush = ret.defaultReadyToFlush
-	return ret, nil
+
+	return &redisStorage{
+		pool:        pool,
+		machineName: machineName,
+		redisKey:    redisKey,
+	}, nil
 }

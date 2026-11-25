@@ -19,11 +19,11 @@ import (
 	"fmt"
 	"net/url"
 	"os"
-	"sync"
 	"time"
 
 	info "github.com/google/cadvisor/info/v1"
 	"github.com/google/cadvisor/lib/storage"
+	"github.com/google/cadvisor/lib/storage/buffered"
 	"github.com/google/cadvisor/lib/version"
 
 	influxdb "github.com/influxdb/influxdb/client"
@@ -35,16 +35,14 @@ func init() {
 
 var argDbRetentionPolicy = flag.String("storage_driver_influxdb_retention_policy", "", "retention policy")
 
+// influxdbStorage converts cAdvisor stats into InfluxDB points and writes
+// whole batches. Batching, retries, queue bounding and write pacing are
+// handled by the buffered.Exporter that wraps it.
 type influxdbStorage struct {
 	client          *influxdb.Client
 	machineName     string
 	database        string
 	retentionPolicy string
-	bufferDuration  time.Duration
-	lastWrite       time.Time
-	points          []*influxdb.Point
-	lock            sync.Mutex
-	readyToFlush    func() bool
 }
 
 // Series names
@@ -113,7 +111,7 @@ func new() (storage.StorageDriver, error) {
 	if err != nil {
 		return nil, err
 	}
-	return newStorage(
+	writer, err := newStorage(
 		hostname,
 		*storage.ArgDbTable,
 		*storage.ArgDbName,
@@ -122,8 +120,11 @@ func new() (storage.StorageDriver, error) {
 		*storage.ArgDbPassword,
 		*storage.ArgDbHost,
 		*storage.ArgDbIsSecure,
-		*storage.ArgDbBufferDuration,
 	)
+	if err != nil {
+		return nil, err
+	}
+	return buffered.NewDriver(writer, buffered.ConfigFromFlags()), nil
 }
 
 // Field names
@@ -383,60 +384,59 @@ func (s *influxdbStorage) resctrlStatsToPoints(
 	return points
 }
 
-func (s *influxdbStorage) OverrideReadyToFlush(readyToFlush func() bool) {
-	s.readyToFlush = readyToFlush
+// statsToPoints converts a single sample into its InfluxDB points.
+func (s *influxdbStorage) statsToPoints(cInfo *info.ContainerInfo, stats *info.ContainerStats) []*influxdb.Point {
+	var points []*influxdb.Point
+	points = append(points, s.containerStatsToPoints(cInfo, stats)...)
+	points = append(points, s.memoryStatsToPoints(cInfo, stats)...)
+	points = append(points, s.hugetlbStatsToPoints(cInfo, stats)...)
+	points = append(points, s.perfStatsToPoints(cInfo, stats)...)
+	points = append(points, s.resctrlStatsToPoints(cInfo, stats)...)
+	points = append(points, s.containerFilesystemStatsToPoints(cInfo, stats)...)
+	return points
 }
 
-func (s *influxdbStorage) defaultReadyToFlush() bool {
-	return time.Since(s.lastWrite) >= s.bufferDuration
-}
-
-func (s *influxdbStorage) AddStats(cInfo *info.ContainerInfo, stats *info.ContainerStats) error {
-	if stats == nil {
+// WriteBatch sends all points of the batch in a single InfluxDB transaction.
+// It is safe for concurrent use when the exporter concurrency exceeds one.
+func (s *influxdbStorage) WriteBatch(batch []buffered.Sample) error {
+	var points []*influxdb.Point
+	var lastTimestamp time.Time
+	for _, sample := range batch {
+		points = append(points, s.statsToPoints(sample.ContainerInfo, sample.Stats)...)
+		lastTimestamp = sample.Stats.Timestamp
+	}
+	if len(points) == 0 {
 		return nil
 	}
-	var pointsToFlush []*influxdb.Point
-	func() {
-		// AddStats will be invoked simultaneously from multiple threads and only one of them will perform a write.
-		s.lock.Lock()
-		defer s.lock.Unlock()
 
-		s.points = append(s.points, s.containerStatsToPoints(cInfo, stats)...)
-		s.points = append(s.points, s.memoryStatsToPoints(cInfo, stats)...)
-		s.points = append(s.points, s.hugetlbStatsToPoints(cInfo, stats)...)
-		s.points = append(s.points, s.perfStatsToPoints(cInfo, stats)...)
-		s.points = append(s.points, s.resctrlStatsToPoints(cInfo, stats)...)
-		s.points = append(s.points, s.containerFilesystemStatsToPoints(cInfo, stats)...)
-		if s.readyToFlush() {
-			pointsToFlush = s.points
-			s.points = make([]*influxdb.Point, 0)
-			s.lastWrite = time.Now()
-		}
-	}()
-	if len(pointsToFlush) > 0 {
-		points := make([]influxdb.Point, len(pointsToFlush))
-		for i, p := range pointsToFlush {
-			points[i] = *p
-		}
+	flattened := make([]influxdb.Point, len(points))
+	for i, p := range points {
+		flattened[i] = *p
+	}
 
-		batchTags := map[string]string{tagMachineName: s.machineName}
-		bp := influxdb.BatchPoints{
-			Points:          points,
-			Database:        s.database,
-			RetentionPolicy: s.retentionPolicy,
-			Tags:            batchTags,
-			Time:            stats.Timestamp,
-		}
-		response, err := s.client.Write(bp)
-		if err != nil || checkResponseForErrors(response) != nil {
-			return fmt.Errorf("failed to write stats to influxDb - %s", err)
-		}
+	batchTags := map[string]string{tagMachineName: s.machineName}
+	bp := influxdb.BatchPoints{
+		Points:          flattened,
+		Database:        s.database,
+		RetentionPolicy: s.retentionPolicy,
+		Tags:            batchTags,
+		Time:            lastTimestamp,
+	}
+	response, err := s.client.Write(bp)
+	if err != nil {
+		return fmt.Errorf("failed to write stats to influxDb: %w", err)
+	}
+	if err := checkResponseForErrors(response); err != nil {
+		return err
 	}
 	return nil
 }
 
+// Close releases the driver. The HTTP client has no explicit resources to
+// close; keep the reference intact so a write still in flight during a
+// timed-out shutdown cannot hit a nil client. The method is safe to call
+// concurrently with WriteBatch.
 func (s *influxdbStorage) Close() error {
-	s.client = nil
 	return nil
 }
 
@@ -452,7 +452,6 @@ func newStorage(
 	password,
 	influxdbHost string,
 	isSecure bool,
-	bufferDuration time.Duration,
 ) (*influxdbStorage, error) {
 	url := &url.URL{
 		Scheme: "http",
@@ -467,24 +466,26 @@ func newStorage(
 		Username:  username,
 		Password:  password,
 		UserAgent: fmt.Sprintf("%v/%v", "cAdvisor", version.Info["version"]),
+		// Bound a single write so an unreachable backend fails fast and the
+		// exporter can retry instead of pinning a worker forever.
+		Timeout: influxWriteTimeout,
 	}
 	client, err := influxdb.NewClient(*config)
 	if err != nil {
 		return nil, err
 	}
 
-	ret := &influxdbStorage{
+	_ = tablename
+	return &influxdbStorage{
 		client:          client,
 		machineName:     machineName,
 		database:        database,
 		retentionPolicy: retentionPolicy,
-		bufferDuration:  bufferDuration,
-		lastWrite:       time.Now(),
-		points:          make([]*influxdb.Point, 0),
-	}
-	ret.readyToFlush = ret.defaultReadyToFlush
-	return ret, nil
+	}, nil
 }
+
+// influxWriteTimeout bounds a single InfluxDB write request.
+const influxWriteTimeout = 10 * time.Second
 
 // Creates a measurement point with a single value field
 func makePoint(name string, value interface{}) *influxdb.Point {

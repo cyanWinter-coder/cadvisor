@@ -133,7 +133,13 @@ func (c *InMemoryCache) RecentStats(name string, start, end time.Time, maxStats 
 
 func (c *InMemoryCache) Close() error {
 	c.containerCacheMap = containerCacheMap{}
-	return nil
+	var errs []error
+	for _, backend := range c.backend {
+		if err := backend.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
 }
 
 func (c *InMemoryCache) RemoveContainer(containerName string) error {
