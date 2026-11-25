@@ -87,6 +87,13 @@ type containerData struct {
 	// Tells the container to stop.
 	stop     chan struct{}
 	stopOnce sync.Once
+	stopErr  error
+
+	// housekeepingWG tracks the running housekeeping goroutine so Stop can
+	// wait for an in-flight stats collection before removing cached data.
+	housekeepingWG sync.WaitGroup
+	startStopMu    sync.Mutex
+	destroyClaim   atomic.Bool
 
 	// Tells the container to immediately collect stats
 	onDemandChan chan chan struct{}
@@ -125,24 +132,54 @@ func jitter(duration time.Duration, maxFactor float64) time.Duration {
 }
 
 func (cd *containerData) Start() error {
-	go cd.housekeeping()
+	cd.startStopMu.Lock()
+	defer cd.startStopMu.Unlock()
+
+	select {
+	case <-cd.stop:
+		return fmt.Errorf("container %q is stopped", cd.info.Name)
+	default:
+	}
+
+	cd.housekeepingWG.Add(1)
+	go func() {
+		defer cd.housekeepingWG.Done()
+		cd.housekeeping()
+	}()
 	return nil
 }
 
 func (cd *containerData) Stop() error {
-	err := cd.memoryCache.RemoveContainer(cd.info.Name)
-	if err != nil {
-		return err
+	cd.stopOnce.Do(cd.shutdown)
+	return cd.stopErr
+}
+
+func (cd *containerData) shutdown() {
+	cd.startStopMu.Lock()
+	if cd.stop == nil {
+		cd.stop = make(chan struct{})
 	}
-	// Use sync.Once to ensure the channel is only closed once, preventing
-	// panic from concurrent calls to Stop() when multiple goroutines try
-	// to destroy the same container simultaneously.
-	cd.stopOnce.Do(func() {
-		close(cd.stop)
-	})
-	cd.perfCollector.Destroy()
-	cd.resctrlCollector.Destroy()
-	return nil
+	close(cd.stop)
+	cd.startStopMu.Unlock()
+
+	// If Start is currently adding its goroutine, let it finish registration
+	// before waiting. Start observes the closed stop channel and does not start
+	// housekeeping.
+	cd.startStopMu.Lock()
+	cd.startStopMu.Unlock()
+	cd.housekeepingWG.Wait()
+
+	// Remove only after the housekeeping goroutine has converged. Otherwise an
+	// in-flight AddStats could recreate the cache entry that this removes.
+	if cd.memoryCache != nil {
+		cd.stopErr = cd.memoryCache.RemoveContainer(cd.info.Name)
+	}
+	if cd.perfCollector != nil {
+		cd.perfCollector.Destroy()
+	}
+	if cd.resctrlCollector != nil {
+		cd.resctrlCollector.Destroy()
+	}
 }
 
 func (cd *containerData) allowErrorLogging() bool {

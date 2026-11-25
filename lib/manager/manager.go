@@ -18,6 +18,7 @@
 package manager
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -304,6 +305,8 @@ type manager struct {
 	machineMu                 sync.RWMutex // protects machineInfo
 	machineInfo               info.MachineInfo
 	quitChannels              []chan error
+	stopOnce                  sync.Once
+	stopErr                   error
 	cadvisorContainer         string
 	inHostNamespace           bool
 	startupTime               time.Time
@@ -391,31 +394,43 @@ func (m *manager) Start() error {
 }
 
 func (m *manager) Stop() error {
-	defer m.destroyCollectors()
-	// Stop and wait on all quit channels.
-	for i, c := range m.quitChannels {
-		// Send the exit signal and wait on the thread to exit (by closing the channel).
+	m.stopOnce.Do(m.stop)
+	return m.stopErr
+}
+
+func (m *manager) stop() {
+	var errs []error
+
+	// Stop discovery/background loops first so no new container can be created
+	// while the tracked collection set is being shut down.
+	for _, c := range m.quitChannels {
+		if c == nil {
+			continue
+		}
+		// Send the exit signal and wait on the thread to exit (by closing the
+		// channel / sending its result).
 		c <- nil
-		err := <-c
-		if err != nil {
-			// Remove the channels that quit successfully.
-			m.quitChannels = m.quitChannels[i:]
-			return err
+		if err := <-c; err != nil {
+			errs = append(errs, err)
 		}
 	}
 	m.quitChannels = make([]chan error, 0, 2)
-	return nil
-}
 
-func (m *manager) destroyCollectors() {
-	m.containers.Range(func(_ namespacedContainerName, container *containerData) bool {
+	// Stop every per-container housekeeping goroutine and wait for in-flight
+	// collections to converge. containerData.Stop is idempotent.
+	m.containers.Range(func(key namespacedContainerName, container *containerData) bool {
 		if container == nil {
+			m.containers.Delete(key)
 			return true
 		}
-		container.perfCollector.Destroy()
-		container.resctrlCollector.Destroy()
+		if err := container.Stop(); err != nil {
+			errs = append(errs, err)
+		}
+		m.containers.Delete(key)
 		return true
 	})
+
+	m.stopErr = errors.Join(errs...)
 }
 
 func (m *manager) updateMachineInfo(quit chan error) {
@@ -933,6 +948,12 @@ func (m *manager) destroyContainer(containerName string) error {
 	if !ok {
 		// Already destroyed, done.
 		return nil
+	}
+	// Concurrent destruction of the same canonical container must have one
+	// winner for lifecycle side effects such as the deletion event. Losers
+	// still wait for Stop's in-flight collection convergence.
+	if !cont.destroyClaim.CompareAndSwap(false, true) {
+		return cont.Stop()
 	}
 
 	exitCode, err := cont.handler.GetExitCode()
