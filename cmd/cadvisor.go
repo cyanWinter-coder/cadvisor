@@ -24,6 +24,7 @@ import (
 	"runtime"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/google/cadvisor/cmd/internal/appmetrics"
 	cadvisorhttp "github.com/google/cadvisor/cmd/internal/http"
@@ -77,6 +78,14 @@ var rawCgroupPrefixWhiteList = flag.String("raw_cgroup_prefix_whitelist", "", "A
 var perfEvents = flag.String("perf_events_config", "", "Path to a JSON file containing configuration of perf events to measure. Empty value disabled perf events measuring.")
 
 var resctrlInterval = flag.Duration("resctrl_interval", 0, "Resctrl mon groups updating interval. Zero value disables updating mon groups.")
+
+var (
+	requestTimeout         = flag.Duration("request_timeout", cadvisorhttp.DefaultRequestTimeout, "Maximum time a single API/HTTP request may run before an explicit timeout status is returned.")
+	apiMaxConcurrent       = flag.Int("api_max_concurrent_requests", 64, "Maximum number of API requests executing heavy queries concurrently. Health and pprof endpoints bypass this bound. 0 disables the bound.")
+	apiCoalesceTTL         = flag.Duration("api_coalesce_ttl", 3*time.Second, "Window during which identical successful API queries are merged/reused, so retries do not trigger another full container fan-out. 0 keeps concurrent single-flight merging only.")
+	slowRequestThreshold   = flag.Duration("slow_request_threshold", cadvisorhttp.DefaultSlowThreshold, "Requests taking at least this long are logged with their duration.")
+	httpRequestMetricsPath = flag.String("http_request_metrics_endpoint", "/debug/http-requests", "Path serving per-path request counts and recent slow requests as JSON. Empty disables it.")
+)
 
 var (
 	// Metrics to be ignored.
@@ -171,6 +180,21 @@ func main() {
 	// Register Prometheus collector to gather information about containers, Go runtime, processes, and machine
 	cadvisorhttp.RegisterPrometheusHandler(mux, resourceManager, *prometheusEndpoint, containerLabelFunc, includedMetrics)
 
+	// Per-path request counters and slow-request timing. Paths are normalized
+	// to route labels so container IDs do not explode metric cardinality.
+	requestMetrics := cadvisorhttp.NewRequestMetrics()
+	requestMetrics.SlowThreshold = *slowRequestThreshold
+	requestMetrics.PathLabel = func(r *http.Request) string {
+		return cadvisorhttp.RouteLabel(r.URL.Path)
+	}
+	if *httpRequestMetricsPath != "" {
+		mux.Handle(*httpRequestMetricsPath, requestMetrics)
+	}
+
+	// Merge identical API queries within a short window to absorb front-end
+	// retry storms against tens of thousands of containers.
+	coalescer := cadvisorhttp.NewCoalescer(*apiCoalesceTTL)
+
 	// Start the manager.
 	if err := resourceManager.Start(); err != nil {
 		klog.Fatalf("Failed to start manager: %v", err)
@@ -181,11 +205,37 @@ func main() {
 
 	klog.V(1).Infof("Starting cAdvisor version: %s-%s on port %d", version.Info["version"], version.Info["revision"], *argPort)
 
+	// Bound, merge and time-box requests. /healthz stays outside the
+	// concurrency/timeout/coalescing gates so liveness probes never queue
+	// behind heavy container queries.
+	guardedMux := cadvisorhttp.Guard(mux, cadvisorhttp.GuardConfig{
+		Metrics:        requestMetrics,
+		SlowThreshold:  *slowRequestThreshold,
+		Timeout:        *requestTimeout,
+		Coalescer:      coalescer,
+		MaxConcurrency: *apiMaxConcurrent,
+		SkipPaths:      []string{"/healthz", *prometheusEndpoint},
+		SkipPrefixes:   []string{"/debug/pprof"},
+		SkipRequest: func(r *http.Request) bool {
+			// Event watches are long-lived chunked streams; request deadlines
+			// and concurrency slots do not apply to them.
+			return r.URL.Query().Get("stream") == "true"
+		},
+		CoalesceShould: func(r *http.Request) bool {
+			return strings.HasPrefix(r.URL.Path, "/api/") && cadvisorhttp.DefaultShouldCoalesce(r)
+		},
+	})
+
 	rootMux := http.NewServeMux()
-	rootMux.Handle(*urlBasePrefix+"/", http.StripPrefix(*urlBasePrefix, mux))
+	rootMux.Handle(*urlBasePrefix+"/", http.StripPrefix(*urlBasePrefix, guardedMux))
 
 	addr := fmt.Sprintf("%s:%d", *argIP, *argPort)
-	klog.Fatal(http.ListenAndServe(addr, rootMux))
+	server := &http.Server{
+		Addr:              addr,
+		Handler:           rootMux,
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+	klog.Fatal(server.ListenAndServe())
 }
 
 func setMaxProcs() {

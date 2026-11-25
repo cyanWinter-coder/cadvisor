@@ -25,6 +25,18 @@ func handleHealthz(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write([]byte("ok"))
 }
 
+// Handler returns the manager-independent liveness handler. It always answers
+// 200 "ok" without consulting the container manager, so it can be mounted
+// outside any query timeout, coalescing or concurrency queue.
+func Handler() http.Handler {
+	return http.HandlerFunc(handleHealthz)
+}
+
+// NewHandler is an alias for Handler.
+func NewHandler() http.Handler {
+	return Handler()
+}
+
 // Register simple HTTP /healthz handler to return "ok".
 func RegisterHandler(mux httpmux.Mux) error {
 	mux.HandleFunc("/healthz", handleHealthz)

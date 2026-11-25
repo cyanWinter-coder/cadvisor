@@ -164,8 +164,9 @@ func (api *version1_1) HandleRequest(requestType string, request []string, m man
 			return fmt.Errorf("failed to get subcontainers for container %q with error: %s", containerName, err)
 		}
 
-		// Only output the containers as JSON.
-		err = writeResult(containers, w)
+		// Only output the containers as JSON. Opt-in pagination/fields are
+		// applied by the shared list presenter; the default shape is unchanged.
+		err = writeContainerInfoList(w, containers, r)
 		if err != nil {
 			return err
 		}
@@ -310,10 +311,15 @@ func (api *version2_0) Version() string {
 }
 
 func (api *version2_0) SupportedRequestTypes() []string {
-	return []string{versionAPI, attributesAPI, eventsAPI, machineAPI, summaryAPI, statsAPI, specAPI, storageAPI, psAPI, customMetricsAPI}
+	return []string{versionAPI, attributesAPI, eventsAPI, machineAPI, summaryAPI, statsAPI, specAPI, storageAPI, psAPI, customMetricsAPI, containersAPI}
 }
 
 func (api *version2_0) HandleRequest(requestType string, request []string, m manager.Manager, w http.ResponseWriter, r *http.Request) error {
+	// The hardened list endpoint owns its option parsing (400 on bad paging
+	// parameters) and only needs the shared v2 options afterwards.
+	if requestType == containersAPI {
+		return handleContainersList(request, m, w, r)
+	}
 	opt, err := GetRequestOptions(r)
 	if err != nil {
 		return err
