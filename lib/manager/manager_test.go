@@ -963,3 +963,22 @@ func TestDestroyContainerConcurrent(t *testing.T) {
 	// At least one event should be recorded.
 	assert.GreaterOrEqual(t, len(mockEventHandler.events), 1, "at least one destruction event should be recorded")
 }
+
+func TestCreationEventCarriesIdentity(t *testing.T) {
+	m := newTestManager()
+	sink := &mockEventHandler{events: make([]*info.Event, 0)}
+	m.eventSink = sink
+
+	cont := m.addContainer(t, "/docker/abc", DockerNamespace)
+	m.registerIncarnation(cont)
+	assert.NotEmpty(t, cont.identity)
+
+	// The manager resolves the container's cgroup path to this incarnation.
+	res, ok := m.ResolveContainer("/docker/abc", time.Now())
+	assert.True(t, ok)
+	assert.Equal(t, cont.identity, res.Identity)
+
+	identity, ok := m.ContainerIdentity("/docker/abc")
+	assert.True(t, ok)
+	assert.Equal(t, cont.identity, identity)
+}

@@ -18,6 +18,7 @@ package oomparser
 
 import (
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -157,7 +158,7 @@ func TestStreamOOMs(t *testing.T) {
 	oomsOut := make(chan *OomInstance)
 
 	go func() {
-		p.StreamOoms(oomsOut)
+		p.StreamOoms(oomsOut, nil)
 	}()
 
 	writeAll := func(m []string, t time.Time) {
@@ -488,4 +489,119 @@ func (m *mockKmsgParser) SetLogger(kmsgparser.Logger) {}
 func (m *mockKmsgParser) Close() error {
 	close(m.messages)
 	return nil
+}
+
+// seekCountingParser records whether SeekEnd was called on the reconnected
+// parser, and otherwise behaves like the plain mock. Unlike mockKmsgParser it
+// never closes its message channel, so tests can close the channel themselves
+// to simulate a stream disconnect without a double close.
+type seekCountingParser struct {
+	messages chan kmsgparser.Message
+	seeked   bool
+}
+
+func (p *seekCountingParser) SeekEnd() error {
+	p.seeked = true
+	return nil
+}
+
+func (p *seekCountingParser) Parse() <-chan kmsgparser.Message { return p.messages }
+func (p *seekCountingParser) SetLogger(kmsgparser.Logger)      {}
+func (p *seekCountingParser) Close() error                     { return nil }
+
+func TestStreamOomsReconnectsAndReportsGap(t *testing.T) {
+	first := make(chan kmsgparser.Message, 2)
+	second := make(chan kmsgparser.Message, 2)
+
+	var mu sync.Mutex
+	reconnects := 0
+	newParser := func() (kmsgparser.Parser, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		reconnects++
+		return &seekCountingParser{messages: second}, nil
+	}
+
+	p := &OomParser{
+		parser:         &seekCountingParser{messages: first},
+		newParser:      newParser,
+		reconnectDelay: time.Millisecond,
+	}
+
+	oomsOut := make(chan *OomInstance, 4)
+	gapsOut := make(chan StreamGap, 4)
+	go p.StreamOoms(oomsOut, gapsOut)
+	// A complete OOM starts with the "invoked oom-killer" line and ends with the
+	// oom-kill details line.
+	first <- kmsgparser.Message{
+		Message:   "hog invoked oom-killer: gfp_mask=0x24000c0, order=0, oom_score_adj=0",
+		Timestamp: time.Unix(999, 0),
+	}
+	first <- kmsgparser.Message{
+		Message:   "oom-kill:constraint=CONSTRAINT_MEMCG,nodemask=(null),cpuset=x,mems_allowed=0,oom_memcg=/c1,task_memcg=/c1,task=hog,pid=42,uid=0",
+		Timestamp: time.Unix(1000, 0),
+	}
+
+	select {
+	case oom := <-oomsOut:
+		assert.Equal(t, "/c1", oom.ContainerName)
+		assert.Equal(t, 42, oom.Pid)
+	case <-time.After(5 * time.Second):
+		t.Fatal("did not receive the OOM from the first stream")
+	}
+
+	// Closing the first channel ends that stream; the parser must reconnect and
+	// report the blind interval.
+	close(first)
+
+	select {
+	case gap := <-gapsOut:
+		assert.Equal(t, time.Unix(1000, 0), gap.Last)
+		assert.False(t, gap.Until.IsZero())
+	case <-time.After(5 * time.Second):
+		t.Fatal("did not receive a stream gap after the disconnect")
+	}
+
+	// The reconnected stream keeps reporting OOMs.
+	time.Sleep(20 * time.Millisecond) // let the reconnect settle
+	second <- kmsgparser.Message{
+		Message:   "hog invoked oom-killer: gfp_mask=0x24000c0, order=0, oom_score_adj=0",
+		Timestamp: time.Unix(1999, 0),
+	}
+	second <- kmsgparser.Message{
+		Message:   "oom-kill:constraint=CONSTRAINT_MEMCG,nodemask=(null),cpuset=x,mems_allowed=0,oom_memcg=/c2,task_memcg=/c2,task=hog,pid=43,uid=0",
+		Timestamp: time.Unix(2000, 0),
+	}
+	close(second)
+
+	select {
+	case oom := <-oomsOut:
+		assert.Equal(t, "/c2", oom.ContainerName)
+		assert.Equal(t, 43, oom.Pid)
+	case <-time.After(5 * time.Second):
+		t.Fatal("did not receive the OOM from the reconnected stream")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Positive(t, reconnects, "the parser should have reconnected")
+}
+
+func TestStreamOomsWithoutReconnectStops(t *testing.T) {
+	msgs := make(chan kmsgparser.Message)
+	p := &OomParser{parser: &seekCountingParser{messages: msgs}}
+
+	out := make(chan *OomInstance)
+	done := make(chan struct{})
+	go func() {
+		p.StreamOoms(out, nil)
+		close(done)
+	}()
+
+	close(msgs)
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("StreamOoms did not return when its source closed and no reconnecting parser was configured")
+	}
 }

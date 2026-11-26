@@ -1168,8 +1168,25 @@ type Event struct {
 	// the absolute container name for which the event occurred
 	ContainerName string `json:"container_name"`
 
-	// the time at which the event occurred
+	// ContainerIdentity identifies the concrete container instance the event
+	// belongs to. Container names (and the runtime IDs embedded in them) can be
+	// reused after a container exits, so this value distinguishes successive
+	// containers that share a name. It is empty when the container could not be
+	// resolved.
+	ContainerIdentity string `json:"container_identity,omitempty"`
+
+	// the time at which the event occurred. For an aggregated event (Count > 1)
+	// this is the time of the first occurrence.
 	Timestamp time.Time `json:"timestamp"`
+
+	// LastTimestamp is the time of the most recent occurrence aggregated into
+	// this event. It is empty for events that were not aggregated.
+	LastTimestamp time.Time `json:"last_timestamp,omitempty"`
+
+	// Count is the number of occurrences aggregated into this event. It is
+	// omitted when the event was not aggregated (i.e. it describes a single
+	// occurrence).
+	Count uint64 `json:"count,omitempty"`
 
 	// the type of event. EventType is an enumerated type
 	EventType EventType `json:"event_type"`
@@ -1188,6 +1205,9 @@ const (
 	EventOomKill           EventType = "oomKill"
 	EventContainerCreation EventType = "containerCreation"
 	EventContainerDeletion EventType = "containerDeletion"
+	// EventStreamGap marks an interval during which the kernel event stream was
+	// disconnected. Events that happened in that interval may be missing.
+	EventStreamGap EventType = "streamGap"
 )
 
 // Extra information about an event. Only one type will be set.
@@ -1197,6 +1217,9 @@ type EventData struct {
 
 	// Information about a container deletion event.
 	ContainerDeletion *ContainerDeletionEventData `json:"container_deletion,omitempty"`
+
+	// Information about a gap in the kernel event stream.
+	StreamGap *StreamGapEventData `json:"stream_gap,omitempty"`
 }
 
 // Information related to an OOM kill instance
@@ -1216,4 +1239,13 @@ type ContainerDeletionEventData struct {
 	// ExitCode is the exit code of the container.
 	// A value of -1 indicates the exit code was not available or not applicable.
 	ExitCode int `json:"exit_code"`
+}
+
+// Information related to a gap in the kernel event stream. Events that
+// happened between Since and Until may not have been observed.
+type StreamGapEventData struct {
+	// Since is the timestamp of the last event observed before the stream broke.
+	Since time.Time `json:"since"`
+	// Until is the timestamp at which the stream was re-established.
+	Until time.Time `json:"until"`
 }

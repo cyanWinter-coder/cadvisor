@@ -68,8 +68,11 @@ func (t *atomicTime) Time() time.Time {
 }
 
 type containerData struct {
-	handler                  container.ContainerHandler
-	info                     containerInfo
+	handler container.ContainerHandler
+	info    containerInfo
+	// identity uniquely identifies this incarnation of the container. It stays
+	// valid after the container exits, unlike the name it was created with.
+	identity                 string
 	memoryCache              *memory.InMemoryCache
 	lock                     sync.Mutex
 	housekeepingInterval     time.Duration

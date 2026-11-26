@@ -15,6 +15,8 @@
 package manager
 
 import (
+	"time"
+
 	info "github.com/google/cadvisor/lib/model"
 
 	"k8s.io/klog/v2"
@@ -53,3 +55,46 @@ func (m *manager) addEvent(e *info.Event) {
 // — and double-registering — the same flags.
 func EventStorageAgeLimit() string   { return *eventStorageAgeLimit }
 func EventStorageEventLimit() string { return *eventStorageEventLimit }
+
+// ContainerResolver maps cgroup paths to the container instances that owned
+// them. The manager implements it; the full binary uses it to attribute kernel
+// events (which name cgroup paths) to the right container incarnation. It is a
+// separate interface so that Manager stays unchanged for other implementations.
+type ContainerResolver interface {
+	// ResolveContainer maps a cgroup path seen at a given time (typically one
+	// printed in a kernel message) to the container instance that owned it then.
+	// Unlike name-based lookups it still works after the container exited and its
+	// name or runtime ID was reused. See identity.go.
+	ResolveContainer(cgroupPath string, at time.Time) (ContainerResolution, bool)
+
+	// ContainerIdentity returns the identity of the newest incarnation of the
+	// named container that has not exited. See identity.go.
+	ContainerIdentity(name string) (string, bool)
+}
+
+var _ ContainerResolver = &manager{}
+
+// ResolveContainer maps a cgroup path (as printed in a kernel message) to the
+// container instance that owned it at the given time. It returns false when no
+// tracked container ever owned the path.
+func (m *manager) ResolveContainer(cgroupPath string, at time.Time) (ContainerResolution, bool) {
+	return m.identityIndex().resolve(cgroupPath, at)
+}
+
+// ContainerIdentity returns the identity of the newest incarnation of the named
+// container that has not exited. It is used to associate counters with a
+// concrete container instance rather than a name that may be reused.
+func (m *manager) ContainerIdentity(name string) (string, bool) {
+	return m.identityIndex().currentIdentity(name)
+}
+
+// identityIndex returns the incarnation index, creating it on first use so that
+// managers built directly (tests) still track identities.
+func (m *manager) identityIndex() *incarnationIndex {
+	m.incarnationsOnce.Do(func() {
+		if m.incarnations == nil {
+			m.incarnations = newIncarnationIndex(defaultIncarnationRetention)
+		}
+	})
+	return m.incarnations
+}

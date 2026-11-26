@@ -35,10 +35,20 @@ var (
 	firstLineRegexp = regexp.MustCompile(`invoked oom-killer:`)
 )
 
+// defaultReconnectDelay is the pause before reopening the kernel log after it
+// disconnects.
+const defaultReconnectDelay = 5 * time.Second
+
 // OomParser wraps a kmsgparser in order to extract OOM events from the
 // individual kernel ring buffer messages.
 type OomParser struct {
 	parser kmsgparser.Parser
+	// newParser re-opens the kernel log. It is only set when the parser owns the
+	// stream (see New), which lets StreamOoms reconnect after a disconnect.
+	// Tests inject a parser with a fixed message source and leave it nil.
+	newParser func() (kmsgparser.Parser, error)
+	// reconnectDelay is the pause before re-opening the kernel log.
+	reconnectDelay time.Duration
 }
 
 // struct that contains information related to an OOM kill instance
@@ -58,6 +68,16 @@ type OomInstance struct {
 	// the constraint that triggered the OOM.  One of CONSTRAINT_NONE,
 	// CONSTRAINT_CPUSET, CONSTRAINT_MEMORY_POLICY, CONSTRAINT_MEMCG
 	Constraint string
+}
+
+// StreamGap reports that the kernel event stream was interrupted between Last
+// and Until, so OOM events in that interval may be missing.
+type StreamGap struct {
+	// Last is the time of the last kernel message read before the disconnect. It
+	// is zero if no message had been read yet.
+	Last time.Time
+	// Until is the time at which the stream was re-established.
+	Until time.Time
 }
 
 // gets the container name from a line and adds it to the oomInstance.
@@ -115,12 +135,61 @@ func checkIfStartOfOomMessages(line string) bool {
 
 // StreamOoms writes to a provided a stream of OomInstance objects representing
 // OOM events that are found in the logs.
-// It will block and should be called from a goroutine.
-func (p *OomParser) StreamOoms(outStream chan<- *OomInstance) {
+// It will block and should be called from a goroutine. When the kernel log
+// stream ends unexpectedly, StreamOoms reconnects and reports the interval it
+// could not observe through gapStream; a nil gapStream disables that reporting.
+func (p *OomParser) StreamOoms(outStream chan<- *OomInstance, gapStream chan<- StreamGap) {
+	var lastMessage time.Time
+	for {
+		lastMessage = p.stream(outStream, lastMessage)
+		if p.newParser == nil {
+			// A parser with a fixed source cannot reconnect. This is the test
+			// path; production parsers always set newParser.
+			klog.Errorf("exiting analyzeLines. OOM events will not be reported.")
+			return
+		}
+
+		// Report the blind interval so consumers can mark events in it as
+		// possibly missing. Never block the stream on a slow gap consumer.
+		until := time.Now()
+		if gapStream != nil {
+			select {
+			case gapStream <- StreamGap{Last: lastMessage, Until: until}:
+			default:
+			}
+		}
+		klog.Warningf("Lost the kernel log stream; reconnecting in %v (events between %v and %v may be missing)",
+			p.reconnectDelay, lastMessage, until)
+		time.Sleep(p.reconnectDelay)
+		for {
+			parser, err := p.newParser()
+			if err == nil {
+				// Start at the current end of the ring buffer: replaying it would
+				// re-report OOMs that were already surfaced (and that older
+				// messages may have been overwritten anyway). The interval is
+				// reported as a gap instead.
+				if seekErr := parser.SeekEnd(); seekErr != nil {
+					klog.Warningf("Unable to seek to the end of the kernel log after reconnecting: %v", seekErr)
+				}
+				p.parser = parser
+				break
+			}
+			klog.Warningf("Unable to reopen the kernel log for OOM detection: %v; retrying in %v", err, p.reconnectDelay)
+			time.Sleep(p.reconnectDelay)
+		}
+	}
+}
+
+// stream reads OOM instances from the current parser until its message channel
+// closes, and returns the timestamp of the last message it saw.
+func (p *OomParser) stream(outStream chan<- *OomInstance, lastMessage time.Time) time.Time {
 	kmsgEntries := p.parser.Parse()
 	defer p.parser.Close()
 
 	for msg := range kmsgEntries {
+		if msg.Timestamp.After(lastMessage) {
+			lastMessage = msg.Timestamp
+		}
 		isOomMessage := checkIfStartOfOomMessages(msg.Message)
 		if isOomMessage {
 			oomCurrentInstance := &OomInstance{
@@ -129,6 +198,9 @@ func (p *OomParser) StreamOoms(outStream chan<- *OomInstance) {
 				TimeOfDeath:         msg.Timestamp,
 			}
 			for msg := range kmsgEntries {
+				if msg.Timestamp.After(lastMessage) {
+					lastMessage = msg.Timestamp
+				}
 				finished, err := getContainerName(msg.Message, oomCurrentInstance)
 				if err != nil {
 					klog.Errorf("%v", err)
@@ -147,18 +219,30 @@ func (p *OomParser) StreamOoms(outStream chan<- *OomInstance) {
 			outStream <- oomCurrentInstance
 		}
 	}
-	// Should not happen
-	klog.Errorf("exiting analyzeLines. OOM events will not be reported.")
+	return lastMessage
 }
 
 // initializes an OomParser object. Returns an OomParser object and an error.
 func New() (*OomParser, error) {
+	parser, err := NewParser()
+	if err != nil {
+		return nil, err
+	}
+	return &OomParser{
+		parser:         parser,
+		newParser:      NewParser,
+		reconnectDelay: defaultReconnectDelay,
+	}, nil
+}
+
+// NewParser opens the kernel log and returns a parser.
+func NewParser() (kmsgparser.Parser, error) {
 	parser, err := kmsgparser.NewParser()
 	if err != nil {
 		return nil, err
 	}
 	parser.SetLogger(glogAdapter{})
-	return &OomParser{parser: parser}, nil
+	return parser, nil
 }
 
 type glogAdapter struct{}

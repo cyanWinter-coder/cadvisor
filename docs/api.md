@@ -34,6 +34,25 @@ The endpoint accepts a certain number of query parameters:
 | `oom_kill_events` | Whether to include OOM kill events                                             | false             |
 | `creation_events` | Whether to include container creation events                                   | false             |
 | `deletion_events` | Whether to include container deletion events                                   | false             |
+| `stream_gap_events` | Whether to include events marking a gap in the kernel event stream           | false             |
+
+Each `Event` carries a `container_name`, which is the absolute cAdvisor name of the
+container, and a `container_identity`, which identifies the concrete container
+instance that produced the event. Because container names (and the runtime IDs
+embedded in them) may be reused after a container exits, an event that arrives
+late is attributed to the container that was running when the event happened, and
+events from a reused name are never conflated.
+
+Repeated occurrences of the same event for the same container instance within the
+aggregation window are combined into a single event: `timestamp` is the first
+occurrence, `last_timestamp` the most recent one, and `count` the number of
+occurrences. Events that were not aggregated have `count` set to 1 and no
+`last_timestamp`.
+
+A `streamGap` event marks an interval during which cAdvisor could not read the
+kernel event stream (the source disconnected and was reconnected). Events in that
+interval may be missing; `event_data.stream_gap` carries the `since` and `until`
+timestamps.
 
 ## Version 1.2
 

@@ -105,7 +105,20 @@ Metric name | Type | Description | Unit (where applicable) | option parameter | 
 `container_threads_max` | Gauge | Maximum number of threads allowed inside the container | | process |
 `container_ulimits_soft` | Gauge | Soft ulimit values for the container root process. Unlimited if -1, except priority and nice | | process |
 
+## Prometheus event store metrics
+
+The `/events` endpoint stores recent events for later retrieval. These metrics expose the health of that store so that events lost to storage limits, slow watchers or kernel log disconnects are visible:
+
+Metric name | Type | Description
+:-----------|:-----|:-----------
+`cadvisor_event_store_dropped_total` | Counter | Cumulative number of events discarded because the event storage limit was reached. The oldest events are dropped first.
+`cadvisor_event_stream_gaps_total` | Counter | Cumulative number of intervals during which the kernel event stream was disconnected and events may have been missed.
+`cadvisor_event_stream_last_event_age_seconds` | Gauge | Seconds since the most recent event was recorded.
+`cadvisor_event_stream_missed_total` | Counter | Cumulative number of events that could not be delivered to a watcher because its channel was full.
+
+
 ## Prometheus hardware metrics
+
 
 The table below lists the Prometheus hardware metrics exposed by cAdvisor (in alphabetical order by metric name) and corresponding `-disable_metrics` / `-enable_metrics` option parameter:
 

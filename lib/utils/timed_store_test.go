@@ -83,6 +83,40 @@ func TestAdd(t *testing.T) {
 	expectAllElements(t, sb, []int{6, 7, 8, 9, 10})
 }
 
+func TestDroppedCountsOnlyLimitEvictions(t *testing.T) {
+	sb := NewTimedStore(time.Hour, 3)
+	for i := 0; i < 3; i++ {
+		sb.Add(createTime(i), i)
+	}
+	assert.Zero(t, sb.Dropped())
+
+	// Filling past the limit drops the oldest entries and counts them.
+	dropped := sb.Add(createTime(3), 3)
+	assert.Equal(t, []interface{}{0}, dropped)
+	assert.EqualValues(t, 1, sb.Dropped())
+
+	// Age-based eviction is not counted as a drop.
+	zero := time.Time{}
+	sb.Add(zero.Add(2*time.Hour), 4)
+	assert.EqualValues(t, 1, sb.Dropped())
+	assert.Equal(t, 1, sb.Size())
+}
+
+func TestReplace(t *testing.T) {
+	sb := NewTimedStore(time.Hour, -1)
+	type item struct{ n int }
+	first := &item{1}
+	second := &item{2}
+	replacement := &item{3}
+	sb.Add(createTime(0), first)
+	sb.Add(createTime(1), second)
+
+	assert.True(t, sb.Replace(first, replacement))
+	assert.Equal(t, replacement, sb.Get(1))
+	assert.False(t, sb.Replace(first, replacement))
+	assert.Equal(t, 2, sb.Size())
+}
+
 func TestGet(t *testing.T) {
 	sb := NewTimedStore(5*time.Second, -1)
 	sb.Add(createTime(1), 1)

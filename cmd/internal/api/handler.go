@@ -48,10 +48,20 @@ const (
 // enough — no need to thread an *events.EventManager through every handler.
 var eventManager events.EventManager
 
+// EventStats reports the health of the /events store, or the zero value when
+// handlers have not been registered. It backs the event store metrics.
+func EventStats() events.Stats {
+	provider, ok := eventManager.(events.StatsProvider)
+	if !ok {
+		return events.Stats{}
+	}
+	return provider.Stats()
+}
+
 func RegisterHandlers(mux httpmux.Mux, m manager.Manager) error {
 	eventManager = events.NewEventManager(parseEventsStoragePolicy())
 	m.SetEventSink(eventManager)
-	startOOMWatcher(eventManager)
+	startOOMWatcher(eventManager, m)
 
 	apiVersions := getAPIVersions()
 	supportedAPIVersions := make(map[string]ApiVersion, len(apiVersions))
@@ -259,10 +269,11 @@ func getEventRequest(r *http.Request) (*events.Request, bool, error) {
 		}
 	}
 	eventTypes := map[string]info.EventType{
-		"oom_events":      info.EventOom,
-		"oom_kill_events": info.EventOomKill,
-		"creation_events": info.EventContainerCreation,
-		"deletion_events": info.EventContainerDeletion,
+		"oom_events":        info.EventOom,
+		"oom_kill_events":   info.EventOomKill,
+		"creation_events":   info.EventContainerCreation,
+		"deletion_events":   info.EventContainerDeletion,
+		"stream_gap_events": info.EventStreamGap,
 	}
 	allEventTypes := false
 	if val, ok := urlMap["all_events"]; ok {

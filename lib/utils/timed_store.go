@@ -15,6 +15,7 @@
 package utils
 
 import (
+	"reflect"
 	"sort"
 	"time"
 )
@@ -39,6 +40,9 @@ type TimedStore struct {
 	buffer   timedStoreDataSlice
 	age      time.Duration
 	maxItems int
+	// dropped counts the items discarded because the store exceeded maxItems.
+	// Items evicted because they aged out are not counted.
+	dropped uint64
 }
 
 type timedStoreData struct {
@@ -57,7 +61,9 @@ func NewTimedStore(age time.Duration, maxItems int) *TimedStore {
 }
 
 // Adds an element to the start of the buffer (removing one from the end if necessary).
-func (s *TimedStore) Add(timestamp time.Time, item interface{}) {
+// It returns the elements it had to discard to stay within maxItems; elements
+// that merely aged out are not returned.
+func (s *TimedStore) Add(timestamp time.Time, item interface{}) []interface{} {
 	data := timedStoreData{
 		timestamp: timestamp,
 		data:      item,
@@ -86,10 +92,17 @@ func (s *TimedStore) Add(timestamp time.Time, item interface{}) {
 	}
 
 	// Remove any elements if over our max size.
+	var dropped []interface{}
 	if s.maxItems >= 0 && len(s.buffer) > s.maxItems {
 		startIndex := len(s.buffer) - s.maxItems
+		dropped = make([]interface{}, 0, startIndex)
+		for i := 0; i < startIndex; i++ {
+			dropped = append(dropped, s.buffer[i].data)
+		}
+		s.dropped += uint64(startIndex)
 		s.buffer = s.buffer[startIndex:]
 	}
+	return dropped
 }
 
 // Returns up to maxResult elements in the specified time period (inclusive).
@@ -161,4 +174,31 @@ func (s *TimedStore) getData(index int) timedStoreData {
 
 func (s *TimedStore) Size() int {
 	return len(s.buffer)
+}
+
+// Dropped returns the cumulative number of items discarded because the store
+// exceeded its max item limit. Age-based eviction is not counted.
+func (s *TimedStore) Dropped() uint64 {
+	return s.dropped
+}
+
+// Replace swaps oldItem for newItem in place, keeping its timestamp. It reports
+// whether oldItem was found. Callers use it to publish an updated copy of an
+// item instead of mutating one that readers may already hold.
+func (s *TimedStore) Replace(oldItem, newItem interface{}) bool {
+	for i := range s.buffer {
+		if sameItem(s.buffer[i].data, oldItem) {
+			s.buffer[i].data = newItem
+			return true
+		}
+	}
+	return false
+}
+
+func sameItem(a, b interface{}) bool {
+	va, vb := reflect.ValueOf(a), reflect.ValueOf(b)
+	if !va.IsValid() || !vb.IsValid() || va.Kind() != reflect.Pointer || vb.Kind() != reflect.Pointer {
+		return false
+	}
+	return va.Pointer() == vb.Pointer()
 }

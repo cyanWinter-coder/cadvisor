@@ -136,6 +136,7 @@ const (
 	EventOomKill           EventType = "oomKill"
 	EventContainerCreation EventType = "containerCreation"
 	EventContainerDeletion EventType = "containerDeletion"
+	EventStreamGap         EventType = "streamGap"
 )
 
 // Extra information about an event. Only one type will be set.
@@ -146,3 +147,6 @@ type OomKillEventData = model.OomKillEventData
 
 // Information related to a container deletion event
 type ContainerDeletionEventData = model.ContainerDeletionEventData
+
+// Information related to a gap in the kernel event stream
+type StreamGapEventData = model.StreamGapEventData

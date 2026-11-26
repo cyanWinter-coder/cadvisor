@@ -219,6 +219,7 @@ func New(memoryCache *memory.InMemoryCache, sysfs sysfs.SysFs, HousekeepingConfi
 		eventsChannel:                         eventsChannel,
 		rawContainerCgroupPathPrefixWhiteList: rawContainerCgroupPathPrefixWhiteList,
 		containerEnvMetadataWhiteList:         containerEnvMetadataWhiteList,
+		incarnations:                          newIncarnationIndex(defaultIncarnationRetention),
 	}
 
 	machineInfo, err := machine.Info(sysfs, fsInfo, inHostNamespace)
@@ -327,6 +328,12 @@ type manager struct {
 	// lifecycle and OOM events. nil for the kubelet (no event machinery). See
 	// events.go.
 	eventSink EventSink
+
+	// incarnations tracks which concrete container instance owned which cgroup
+	// path and when, so late kernel events can be attributed to the container
+	// that existed when they happened even after its name was reused.
+	incarnations     *incarnationIndex
+	incarnationsOnce sync.Once
 }
 
 // Start the container manager.
@@ -908,21 +915,49 @@ func (m *manager) createContainer(containerName string, watchSource watcher.Cont
 
 	klog.V(3).Infof("Added container: %q (aliases: %v, namespace: %q)", containerName, cont.info.Aliases, cont.info.Namespace)
 
+	// Record which concrete container instance this is. The runtime may reuse
+	// the container name (and ID) once it exits, so a late kernel event must be
+	// resolved against this incarnation rather than whatever holds the name now.
+	creationTime := m.registerIncarnation(cont)
+
 	// Surface the container-creation event to the sink (no-op if unset).
 	if m.eventSink != nil {
-		var creationTime time.Time
-		if spec, specErr := cont.handler.GetSpec(); specErr == nil {
-			creationTime = spec.CreationTime
-		}
 		m.addEvent(&info.Event{
-			ContainerName: cont.info.Name,
-			Timestamp:     creationTime,
-			EventType:     info.EventContainerCreation,
+			ContainerName:     cont.info.Name,
+			ContainerIdentity: cont.identity,
+			Timestamp:         creationTime,
+			EventType:         info.EventContainerCreation,
 		})
 	}
 
 	// Start the container's housekeeping.
 	return cont.Start()
+}
+
+// registerIncarnation records the concrete container instance cont represents
+// in the identity index and returns the container's creation time. The runtime
+// may reuse the container name (and ID) once it exits, so a late kernel event
+// must be resolved against the incarnation that was running then, not against
+// whatever holds the name now.
+func (m *manager) registerIncarnation(cont *containerData) time.Time {
+	var creationTime time.Time
+	if spec, err := cont.handler.GetSpec(); err == nil {
+		creationTime = spec.CreationTime
+	}
+	cont.identity = m.identityIndex().register(cont.info.ContainerReference, handlerCgroupPaths(cont.handler), creationTime, time.Now())
+	return creationTime
+}
+
+// handlerCgroupPaths returns the absolute cgroup paths of a container handler,
+// for the cgroup controllers cAdvisor knows about.
+func handlerCgroupPaths(handler container.ContainerHandler) []string {
+	var out []string
+	for _, resource := range []string{"memory", "cpu", "cpuacct", "cpuset", "pids", "blkio", "hugetlb", "perf_event"} {
+		if p, err := handler.GetCgroupPath(resource); err == nil && p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 func (m *manager) destroyContainer(containerName string) error {
@@ -956,12 +991,20 @@ func (m *manager) destroyContainer(containerName string) error {
 	}
 	klog.V(3).Infof("Destroyed container: %q (aliases: %v, namespace: %q, exit_code: %d)", containerName, cont.info.Aliases, cont.info.Namespace, exitCode)
 
+	// Close the incarnation so events timestamped after this point do not resolve
+	// to it. It stays queryable for events that predate the exit.
+	deletionTime := time.Now()
+	if cont.identity != "" {
+		m.identityIndex().markDeleted(cont.identity, deletionTime)
+	}
+
 	// Surface the container-deletion event to the sink (no-op if unset),
 	// carrying the exit code (the /events API and its tests rely on it).
 	m.addEvent(&info.Event{
-		ContainerName: cont.info.Name,
-		Timestamp:     time.Now(),
-		EventType:     info.EventContainerDeletion,
+		ContainerName:     cont.info.Name,
+		ContainerIdentity: cont.identity,
+		Timestamp:         deletionTime,
+		EventType:         info.EventContainerDeletion,
 		EventData: info.EventData{
 			ContainerDeletion: &info.ContainerDeletionEventData{
 				ExitCode: exitCode,
